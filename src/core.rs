@@ -1,13 +1,13 @@
 use std::error::Error;
 
-use capstone::Capstone;
 use capstone::arch::riscv::RiscVOperand;
 use capstone::arch::riscv::{RiscVInsn, RiscVInsn::*, RiscVReg::*};
-use capstone::prelude::{RegId, InsnId};
-use elf::{ElfBytes ,endian};
+use capstone::prelude::{InsnId, RegId};
+use capstone::Capstone;
+use elf::{endian, ElfBytes};
 
-use crate::gadget::{Gadget, GadgetInsn, GadgetRoot};
 use crate::err::RVError;
+use crate::gadget::{Gadget, GadgetInsn, GadgetRoot};
 
 const ALIGNMENT: usize = 2;
 const MAX_INSSZ: usize = 4;
@@ -154,8 +154,10 @@ pub fn ins_from_str(ins: &str) -> Result<InsnId, RVError> {
         return ins_from_str(&format!("c.{}", ins));
     }
     match val {
-        RISCV_INS_INVALID => Err(RVError {msg: String::from("not an instruction")}),
-        _ => Ok(InsnId(val as u32))
+        RISCV_INS_INVALID => Err(RVError {
+            msg: String::from("not an instruction"),
+        }),
+        _ => Ok(InsnId(val as u32)),
     }
 }
 
@@ -229,12 +231,16 @@ pub fn reg_from_str(reg: &str) -> Result<RegId, RVError> {
         _ => RISCV_REG_INVALID,
     };
     match val {
-        RISCV_REG_INVALID => Err(RVError {msg: String::from("not a register")}),
-        _ => Ok(RegId(val as u16))
+        RISCV_REG_INVALID => Err(RVError {
+            msg: String::from("not a register"),
+        }),
+        _ => Ok(RegId(val as u16)),
     }
 }
 
-pub fn get_code<'a>(elf: &'a ElfBytes<endian::AnyEndian>) -> Result<(usize, usize, u64), Box<dyn Error>> {
+pub fn get_code<'a>(
+    elf: &'a ElfBytes<endian::AnyEndian>,
+) -> Result<(usize, usize, u64), Box<dyn Error>> {
     if let Some(segs) = elf.segments() {
         for phdr in segs {
             if phdr.p_flags == elf::abi::PF_R | elf::abi::PF_X {
@@ -242,10 +248,16 @@ pub fn get_code<'a>(elf: &'a ElfBytes<endian::AnyEndian>) -> Result<(usize, usiz
             }
         }
     }
-    return Err(Box::new(RVError {msg: String::from("There is no .text section. The binary may be stripped")}));
+    return Err(Box::new(RVError {
+        msg: String::from("There is no .text section. The binary may be stripped"),
+    }));
 }
 
-pub fn find_gadget_roots<'a>(cs: &'a capstone::Capstone, code: &[u8], jr: Option<RegId>) -> Vec<GadgetRoot<'a>> {
+pub fn find_gadget_roots<'a>(
+    cs: &'a capstone::Capstone,
+    code: &[u8],
+    jr: Option<RegId>,
+) -> Vec<GadgetRoot<'a>> {
     let mut roots = Vec::new();
 
     for off in (0..code.len()).step_by(ALIGNMENT) {
@@ -256,11 +268,11 @@ pub fn find_gadget_roots<'a>(cs: &'a capstone::Capstone, code: &[u8], jr: Option
                         for op in ins.operands() {
                             if let RiscVOperand::Reg(reg) = op {
                                 if reg == &RegId(0) {
-                                    continue
+                                    continue;
                                 }
                                 if let Some(target) = jr {
                                     if reg != &target {
-                                        break
+                                        break;
                                     }
                                 }
                                 roots.push(GadgetRoot::from(ins, off as u64));
@@ -275,44 +287,79 @@ pub fn find_gadget_roots<'a>(cs: &'a capstone::Capstone, code: &[u8], jr: Option
     return roots;
 }
 
-pub fn find_gadgets_at_root<'a>(cs: &'a Capstone, root: GadgetRoot<'a>, addr: u64, code: &'a [u8], max: usize) -> Vec<Gadget<'a>> {
+pub fn find_gadgets_at_root<'a>(
+    cs: &'a Capstone,
+    root: GadgetRoot<'a>,
+    addr: u64,
+    code: &'a [u8],
+    max: usize,
+) -> Vec<Gadget<'a>> {
     let mut gadgets: Vec<Gadget> = Vec::new();
-    let mut insns: Vec<GadgetInsn> = Vec::new();
 
-    disas_back_at(cs, &mut gadgets, root.clone(), &mut insns, addr, root.off, code, max);
-    return gadgets;
-}
+    let off = root.off;
 
-fn disas_back_at<'a>(cs: &'a Capstone, gadgets: &mut Vec<Gadget<'a>>, root: GadgetRoot<'a>, insns: &mut Vec<GadgetInsn<'a>>, addr: u64, off: u64, code: &'a [u8], max: usize) -> bool {
-    if max == 0 || off <= 0 {
-        return true ;
+    #[derive(Clone, Copy)]
+    enum StackState {
+        // off
+        Unvisited(u64),
+        // off, pushed
+        Compressed(u64, bool),
+        // pushed
+        Visited(bool),
     }
-    
-    for i in (MIN_INSSZ as u64 ..= MAX_INSSZ as u64).step_by(ALIGNMENT) {
-        if i as u64 > off {
-            break;
-        }
-        if let Ok(ins) = cs.disasm_count(&code[(off - i) as usize..], addr + (off - i), 1) {
-            if let Some(ins) = ins.first() {
-                if ins.len() != i as usize {
-                    continue;
-                }
-                if is_branching_ins(ins.id()) {
-                    break;
-                }
-                if let Ok(ins) = GadgetInsn::create(cs, ins) {
-                    insns.push(ins);
-                    if disas_back_at(cs, gadgets, root.clone(), insns, addr, off - i, code, max - 1) {
-                        if let Ok(g) = Gadget::create(root, insns.clone()) {
-                            gadgets.push(g);
+    use StackState::*;
+
+    let mut stack_insns: Vec<GadgetInsn<'a>> = vec![];
+    let mut stack: Vec<StackState> = vec![Unvisited(off)];
+
+    while let Some(state) = stack.pop() {
+        match state {
+            Unvisited(off) => {
+                if 4 <= off && stack_insns.len() < max {
+                    if let Ok(ins) =
+                        cs.disasm_all(&code[(off - 4) as usize..off as usize], addr + off - 4)
+                    {
+                        if let Some(ins) = ins.first() {
+                            if ins.len() == 4 as usize && !is_branching_ins(ins.id()) {
+                                if let Ok(insn) = GadgetInsn::create(cs, ins) {
+                                    stack.push(Compressed(off, true));
+                                    stack.push(Unvisited(off - 4));
+                                    stack_insns.push(insn);
+                                    continue;
+                                }
+                            }
                         }
-                        insns.pop();
-                        return false;
                     }
-                    insns.pop();
                 }
+                stack.push(Compressed(off, false))
+            }
+            Compressed(off, pushed) => {
+                if 2 <= off && stack_insns.len() < max {
+                    if let Ok(ins) =
+                        cs.disasm_count(&code[(off - 2) as usize..off as usize], addr + off - 2, 1)
+                    {
+                        if let Some(ins) = ins.first() {
+                            if ins.len() == 2 as usize && !is_branching_ins(ins.id()) {
+                                if let Ok(insn) = GadgetInsn::create(cs, ins) {
+                                    stack.append(&mut vec![Visited(true), Unvisited(off - 2)]);
+                                    stack_insns.push(insn);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                stack.push(Visited(pushed))
+            }
+            Visited(pushed) => {
+                if !pushed && !stack_insns.is_empty(){
+                    if let Ok(g) = Gadget::create(root.clone(), stack_insns.clone()) {
+                        gadgets.push(g);
+                    }
+                }
+                stack_insns.pop();
             }
         }
     }
-    return true;
+    return gadgets;
 }
